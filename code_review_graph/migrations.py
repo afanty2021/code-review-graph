@@ -41,6 +41,7 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 
 _KNOWN_TABLES = frozenset({
     "nodes", "edges", "metadata", "communities", "flows", "flow_memberships", "nodes_fts",
+    "community_summaries", "flow_snapshots", "risk_index",
 })
 
 
@@ -156,6 +157,87 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
         logger.info("Migration v5: created nodes_fts FTS5 virtual table")
 
 
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    """v6: Add pre-computed summary tables for token-efficient queries."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS community_summaries (
+            community_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            purpose TEXT DEFAULT '',
+            key_symbols TEXT DEFAULT '[]',
+            risk TEXT DEFAULT 'unknown',
+            size INTEGER DEFAULT 0,
+            dominant_language TEXT DEFAULT '',
+            FOREIGN KEY (community_id) REFERENCES communities(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS flow_snapshots (
+            flow_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            entry_point TEXT NOT NULL,
+            critical_path TEXT DEFAULT '[]',
+            criticality REAL DEFAULT 0.0,
+            node_count INTEGER DEFAULT 0,
+            file_count INTEGER DEFAULT 0,
+            FOREIGN KEY (flow_id) REFERENCES flows(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS risk_index (
+            node_id INTEGER PRIMARY KEY,
+            qualified_name TEXT NOT NULL,
+            risk_score REAL DEFAULT 0.0,
+            caller_count INTEGER DEFAULT 0,
+            test_coverage TEXT DEFAULT 'unknown',
+            security_relevant INTEGER DEFAULT 0,
+            last_computed TEXT DEFAULT '',
+            FOREIGN KEY (node_id) REFERENCES nodes(id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_risk_index_score "
+        "ON risk_index(risk_score DESC)"
+    )
+    logger.info("Migration v6: created summary tables "
+                "(community_summaries, flow_snapshots, risk_index)")
+
+
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    """v7: Add compound edge indexes for summary and risk queries."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_target_kind "
+        "ON edges(target_qualified, kind)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_source_kind "
+        "ON edges(source_qualified, kind)"
+    )
+    logger.info("Migration v7: added compound edge indexes")
+
+
+def _migrate_v8(conn: sqlite3.Connection) -> None:
+    """v8: Add composite index on edges for upsert_edge performance."""
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_edges_composite
+        ON edges(kind, source_qualified, target_qualified, file_path, line)
+    """)
+    logger.info("Migration v8: created composite edge index")
+
+
+def _migrate_v9(conn: sqlite3.Connection) -> None:
+    """v9: Add confidence scoring to edges."""
+    if not _has_column(conn, "edges", "confidence"):
+        conn.execute(
+            "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0"
+        )
+    if not _has_column(conn, "edges", "confidence_tier"):
+        conn.execute(
+            "ALTER TABLE edges ADD COLUMN confidence_tier TEXT DEFAULT 'EXTRACTED'"
+        )
+    logger.info("Migration v9: added edge confidence columns")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -165,6 +247,10 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     3: _migrate_v3,
     4: _migrate_v4,
     5: _migrate_v5,
+    6: _migrate_v6,
+    7: _migrate_v7,
+    8: _migrate_v8,
+    9: _migrate_v9,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())
@@ -190,7 +276,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             MIGRATIONS[version](conn)
             _set_schema_version(conn, version)
             conn.commit()
-        except Exception:
+        except sqlite3.Error:
             conn.rollback()
             logger.error("Migration v%d failed, rolling back", version, exc_info=True)
             raise

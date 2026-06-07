@@ -58,22 +58,28 @@ _BUILTIN_CALL_NAMES: set[str] = {
 }
 
 
-def _validate_repo_root(path: Path) -> Path:
+def _validate_repo_root(path: "Path | str") -> Path:
     """Validate that a path is a plausible project root.
 
-    Ensures the path is an existing directory that contains a ``.git``
-    or ``.code-review-graph`` directory, preventing arbitrary file-system
-    traversal via the ``repo_root`` parameter.
+    Ensures the path is an existing directory that contains a ``.git``,
+    ``.svn``, or ``.code-review-graph`` directory, preventing arbitrary
+    file-system traversal via the ``repo_root`` parameter.
     """
-    resolved = path.resolve()
+    resolved = Path(path).resolve()
     if not resolved.is_dir():
         raise ValueError(
             f"repo_root is not an existing directory: {resolved}"
         )
-    if not (resolved / ".git").exists() and not (resolved / ".code-review-graph").exists():
+    has_vcs = (
+        (resolved / ".git").exists()
+        or (resolved / ".svn").exists()
+        or (resolved / ".code-review-graph").exists()
+    )
+    if not has_vcs:
         raise ValueError(
-            f"repo_root does not look like a project root (no .git or "
-            f".code-review-graph directory found): {resolved}"
+            f"repo_root does not look like a project root "
+            f"(no .git, .svn, or .code-review-graph directory found): "
+            f"{resolved}"
         )
     return resolved
 
@@ -83,3 +89,79 @@ def _get_store(repo_root: str | None = None) -> tuple[GraphStore, Path]:
     root = _validate_repo_root(Path(repo_root)) if repo_root else find_project_root()
     db_path = get_db_path(root)
     return GraphStore(db_path), root
+
+
+def _resolve_graph_file_paths(
+    store: GraphStore, root: Path, file_paths: list[str],
+) -> list[str]:
+    """Resolve user-facing file paths to the paths stored in the graph.
+
+    Graphs may contain absolute paths, repo-relative paths, or cwd-relative
+    paths depending on how they were built. Tool inputs are usually relative to
+    repo root, so exact matching alone can miss existing graph nodes.
+    """
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path not in seen:
+            resolved.append(path)
+            seen.add(path)
+
+    for file_path in file_paths:
+        raw = file_path.replace("\\", "/")
+        candidates = [raw]
+        path = Path(file_path)
+        if path.is_absolute():
+            try:
+                candidates.append(str(path.resolve().relative_to(root)).replace("\\", "/"))
+            except ValueError:
+                pass
+        else:
+            candidates.append(str(root / path))
+
+        for candidate in candidates:
+            if store.get_nodes_by_file(candidate):
+                add(candidate)
+
+        suffixes = []
+        for candidate in candidates:
+            normalized = candidate.replace("\\", "/")
+            if normalized not in suffixes:
+                suffixes.append(normalized)
+
+        for suffix in suffixes:
+            for matched_path in store.get_files_matching(suffix):
+                add(matched_path)
+
+    return resolved
+
+
+def compact_response(
+    summary: str,
+    key_entities: list[str] | None = None,
+    risk: str = "unknown",
+    communities: list[str] | None = None,
+    flows_affected: list[str] | None = None,
+    next_tool_suggestions: list[str] | None = None,
+    data: dict[str, Any] | None = None,
+    detail_level: str = "minimal",
+) -> dict[str, Any]:
+    """Standard compact response format for token efficiency."""
+    resp: dict[str, Any] = {
+        "status": "ok",
+        "summary": summary,
+    }
+    if key_entities:
+        resp["key_entities"] = key_entities[:10]
+    if risk != "unknown":
+        resp["risk"] = risk
+    if communities:
+        resp["communities"] = communities[:5]
+    if flows_affected:
+        resp["flows_affected"] = flows_affected[:5]
+    if next_tool_suggestions:
+        resp["next_tool_suggestions"] = next_tool_suggestions[:3]
+    if detail_level != "minimal" and data:
+        resp["data"] = data
+    return resp

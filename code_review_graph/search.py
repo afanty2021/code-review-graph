@@ -35,23 +35,32 @@ def rebuild_fts_index(store: GraphStore) -> int:
     # the FTS5 virtual table DDL, which is tightly coupled to SQLite internals.
     conn = store._conn
 
-    # Drop and recreate the FTS table to avoid content-sync mismatch issues
-    conn.execute("DROP TABLE IF EXISTS nodes_fts")
-    conn.execute("""
-        CREATE VIRTUAL TABLE nodes_fts USING fts5(
-            name, qualified_name, file_path, signature,
-            tokenize='porter unicode61'
-        )
-    """)
-    conn.commit()
+    # Wrap the full DROP + CREATE + INSERT sequence in an explicit transaction
+    # so a crash mid-rebuild cannot leave the DB without an FTS table at all
+    # (DROP succeeded but CREATE/INSERT didn't).  See #259.
+    if conn.in_transaction:
+        logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
+        conn.rollback()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Drop and recreate the FTS table with content sync to match migration v5
+        conn.execute("DROP TABLE IF EXISTS nodes_fts")
+        conn.execute("""
+            CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                name, qualified_name, file_path, signature,
+                content='nodes', content_rowid='rowid',
+                tokenize='porter unicode61'
+            )
+        """)
 
-    # Populate from nodes table
-    conn.execute("""
-        INSERT INTO nodes_fts(rowid, name, qualified_name, file_path, signature)
-        SELECT id, name, qualified_name, file_path, COALESCE(signature, '')
-        FROM nodes
-    """)
-    conn.commit()
+        # Rebuild from the content table (nodes) using the FTS5 rebuild command
+        conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+
+
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
     count = conn.execute("SELECT count(*) FROM nodes_fts").fetchone()[0]
     logger.info("FTS index rebuilt: %d rows indexed", count)
@@ -63,18 +72,49 @@ def rebuild_fts_index(store: GraphStore) -> int:
 # ---------------------------------------------------------------------------
 
 
-def detect_query_kind_boost(query: str) -> dict[str, float]:
-    """Detect query patterns and return kind-specific boost multipliers.
+_DOTTED_IDENT_RE = re.compile(r'\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+\b')
+_SNAKE_IDENT_RE = re.compile(r'\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b')
+_PASCAL_IDENT_RE = re.compile(r'\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b')
+
+
+def extract_query_identifiers(query: str) -> list[str]:
+    """Pull out identifier-shaped tokens from anywhere in a query.
+
+    Catches dotted forms (``Context.Next``), snake_case (``get_dependant``),
+    and CamelCase (``APIRoute``) even when they're embedded in a natural-
+    language sentence. Used to boost search hits whose qualified_name
+    contains any of these tokens, so an LLM asking "Who advances the gin
+    middleware chain via Context.Next" lands on ``Context.Next`` instead of
+    the bare ``Context`` class.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for pat in (_DOTTED_IDENT_RE, _SNAKE_IDENT_RE, _PASCAL_IDENT_RE):
+        for match in pat.findall(query):
+            lo = match.lower()
+            if lo not in seen and len(lo) >= 3:
+                seen.add(lo)
+                found.append(lo)
+    return found
+
+
+def detect_query_kind_boost(query: str) -> dict[str, Any]:
+    """Detect query patterns and return per-node boost multipliers.
 
     Heuristics:
     - PascalCase queries (e.g. ``MyClass``) boost Class/Type by 1.5x
     - snake_case queries (e.g. ``get_users``) boost Function by 1.5x
     - Queries containing ``.`` boost qualified name matches by 2.0x
+    - Identifier-shaped tokens *anywhere* in the query (dotted, snake_case,
+      CamelCase) boost results whose qualified_name contains them by 2.0x.
+      See ``extract_query_identifiers``.
 
     Returns:
-        Dict mapping node kind strings to boost multipliers.
+        Dict whose keys are either node kind strings (mapped to float
+        multipliers) or one of the special keys ``_qualified``,
+        ``_qualified_identifiers``.
     """
-    boosts: dict[str, float] = {}
+    boosts: dict[str, Any] = {}
 
     if not query or not query.strip():
         return boosts
@@ -93,6 +133,11 @@ def detect_query_kind_boost(query: str) -> dict[str, float]:
     # Dotted path: boost qualified name matches
     if '.' in q:
         boosts["_qualified"] = 2.0
+
+    # Identifiers extracted from anywhere in the query
+    idents = extract_query_identifiers(q)
+    if idents:
+        boosts["_qualified_identifiers"] = idents
 
     return boosts
 
@@ -169,6 +214,7 @@ def _embedding_search(
     query: str,
     limit: int = 50,
     model: str | None = None,
+    provider: str | None = None,
 ) -> list[tuple[int, float]]:
     """Run a vector similarity search using the embedding store.
 
@@ -181,7 +227,7 @@ def _embedding_search(
         return []
 
     try:
-        emb_store = EmbeddingStore(store.db_path, model=model)
+        emb_store = EmbeddingStore(store.db_path, provider=provider, model=model)
         try:
             if not emb_store.available or emb_store.count() == 0:
                 return []
@@ -266,6 +312,7 @@ def hybrid_search(
     limit: int = 20,
     context_files: Optional[list[str]] = None,
     model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Hybrid search combining FTS5 BM25 and vector embeddings via RRF.
 
@@ -303,7 +350,9 @@ def hybrid_search(
         logger.warning("FTS5 unavailable, will use fallback: %s", e)
 
     # Try embedding search
-    emb_results = _embedding_search(store, query, limit=fetch_limit, model=model)
+    emb_results = _embedding_search(
+        store, query, limit=fetch_limit, model=model, provider=provider,
+    )
 
     # ------ Phase 2: Merge via RRF or fallback ------
     if fts_results or emb_results:
@@ -355,6 +404,11 @@ def hybrid_search(
         if "_qualified" in kind_boosts and '.' in query:
             if query.lower() in qualified_name.lower():
                 boost *= kind_boosts["_qualified"]
+        idents = kind_boosts.get("_qualified_identifiers")
+        if idents:
+            qn_lo = qualified_name.lower()
+            if any(ident in qn_lo for ident in idents):
+                boost *= 2.0
         if context_set and file_path in context_set:
             boost *= 1.5
 

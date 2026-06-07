@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from ..embeddings import EmbeddingStore, embed_all_nodes
-from ..incremental import get_db_path
-from ._common import _get_store
+from ..incremental import find_project_root, get_db_path
+from ._common import _get_store, _validate_repo_root
 
 # ---------------------------------------------------------------------------
 # Tool 7: embed_graph
@@ -17,37 +17,52 @@ from ._common import _get_store
 def embed_graph(
     repo_root: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Compute vector embeddings for all graph nodes to enable semantic search.
 
-    Requires: ``pip install code-review-graph[embeddings]``
+    Requires: ``pip install code-review-graph[embeddings]`` (local provider only;
+    cloud providers like ``openai`` / ``google`` / ``minimax`` use stdlib ``urllib``).
     Default model: all-MiniLM-L6-v2. Override via ``model`` param or
     CRG_EMBEDDING_MODEL env var.
-    Changing the model re-embeds all nodes automatically.
+    Changing the model or provider re-embeds all nodes automatically.
 
     Only embeds nodes that don't already have up-to-date embeddings.
 
     Args:
         repo_root: Repository root path. Auto-detected if omitted.
-        model: Embedding model name (HuggingFace ID or local path).
-               Falls back to CRG_EMBEDDING_MODEL env var, then
-               all-MiniLM-L6-v2.
+        model: Embedding model name. For local: HuggingFace ID or path;
+               for openai: model ID (e.g. ``text-embedding-3-small``);
+               for google: Gemini model ID. Falls back to
+               CRG_EMBEDDING_MODEL / CRG_OPENAI_MODEL env vars as appropriate.
+        provider: Provider name: ``local`` (default), ``openai``, ``google``,
+                  or ``minimax``. ``openai`` requires CRG_OPENAI_BASE_URL +
+                  CRG_OPENAI_API_KEY + CRG_OPENAI_MODEL env vars and accepts
+                  any OpenAI-compatible endpoint (real OpenAI, Azure, new-api,
+                  LiteLLM, vLLM, LocalAI, Ollama openai-mode, etc.).
 
     Returns:
         Number of nodes embedded and total embedding count.
     """
     store, root = _get_store(repo_root)
     db_path = get_db_path(root)
-    emb_store = EmbeddingStore(db_path, model=model)
+    emb_store = EmbeddingStore(db_path, provider=provider, model=model)
     try:
         if not emb_store.available:
-            return {
-                "status": "error",
-                "error": (
-                    "sentence-transformers is not installed. "
-                    "Install with: pip install code-review-graph[embeddings]"
-                ),
-            }
+            if provider in ("openai", "google", "minimax"):
+                err = (
+                    f"The '{provider}' embedding provider is not available. "
+                    "Check the required environment variables "
+                    "(see README and `get_provider()` docstring) and that "
+                    "the endpoint is reachable."
+                )
+            else:
+                err = (
+                    "The local embedding provider needs sentence-transformers. "
+                    "Install with: pip install code-review-graph[embeddings] — "
+                    "or switch provider to 'openai' / 'google' / 'minimax'."
+                )
+            return {"status": "error", "error": err}
 
         newly_embedded = embed_all_nodes(store, emb_store)
         total = emb_store.count()
@@ -94,17 +109,27 @@ def get_docs_section(
 
     search_roots: list[Path] = []
 
+    # Wheel install: docs are packaged inside code_review_graph/docs.
+    in_pkg_docs = (
+        Path(__file__).parent.parent
+        / "docs"
+        / "LLM-OPTIMIZED-REFERENCE.md"
+    )
     if repo_root:
-        search_roots.append(Path(repo_root))
+        try:
+            search_roots.append(_validate_repo_root(Path(repo_root)))
+        except ValueError:
+            pass
+    elif in_pkg_docs.exists():
+        in_pkg_root = in_pkg_docs.parent.parent
+        search_roots.append(in_pkg_root)
 
-    try:
-        _, root = _get_store(repo_root)
-        if root not in search_roots:
-            search_roots.append(root)
-    except (RuntimeError, ValueError):
-        pass
+    if not repo_root:
+        project_root = find_project_root()
+        if project_root not in search_roots:
+            search_roots.append(project_root)
 
-    # Fallback: package directory (for uvx/pip installs)
+    # Editable/source-tree fallback: docs live next to code_review_graph/.
     pkg_docs = (
         Path(__file__).parent.parent.parent
         / "docs"
@@ -118,7 +143,7 @@ def get_docs_section(
     for search_root in search_roots:
         candidate = search_root / "docs" / "LLM-OPTIMIZED-REFERENCE.md"
         if candidate.exists():
-            content = candidate.read_text(encoding="utf-8")
+            content = candidate.read_text(encoding="utf-8", errors="replace")
             match = _re.search(
                 rf'<section name="{_re.escape(section_name)}">'
                 r"(.*?)</section>",
@@ -168,11 +193,12 @@ def generate_wiki_func(
     Returns:
         Status with pages_generated, pages_updated, pages_unchanged counts.
     """
+    from ..incremental import get_data_dir
     from ..wiki import generate_wiki
 
     store, root = _get_store(repo_root)
     try:
-        wiki_dir = root / ".code-review-graph" / "wiki"
+        wiki_dir = get_data_dir(root) / "wiki"
         result = generate_wiki(store, wiki_dir, force=force)
         total = (
             result["pages_generated"]
@@ -217,10 +243,11 @@ def get_wiki_page_func(
     Returns:
         Page content or not_found status.
     """
+    from ..incremental import get_data_dir
     from ..wiki import get_wiki_page
 
     _, root = _get_store(repo_root)
-    wiki_dir = root / ".code-review-graph" / "wiki"
+    wiki_dir = get_data_dir(root) / "wiki"
     content = get_wiki_page(wiki_dir, community_name)
     if content is None:
         return {

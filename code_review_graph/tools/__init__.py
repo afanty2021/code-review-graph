@@ -1,6 +1,6 @@
 """MCP tool definitions for the Code Review Graph server.
 
-Exposes 22 tools:
+Exposes 27 tools:
 1. build_or_update_graph  - full or incremental build
 2. get_impact_radius      - blast radius from changed files
 3. query_graph            - predefined graph queries
@@ -23,12 +23,20 @@ Exposes 22 tools:
 20. get_wiki_page         - retrieve a specific wiki page
 21. list_repos            - list registered repositories
 22. cross_repo_search     - search across all registered repositories
+23. get_hub_nodes         - find most connected nodes (architectural hotspots)
+24. get_bridge_nodes      - find architectural chokepoints (betweenness centrality)
+25. get_knowledge_gaps    - identify structural weaknesses
+26. get_surprising_connections - find unexpected architectural coupling
+27. get_suggested_questions - auto-generated review questions from graph analysis
+28. traverse_graph        - BFS/DFS traversal from best-matching node
 """
 
 from __future__ import annotations
 
 # Re-export names that external code may patch via "code_review_graph.tools.*"
+from ..changes import parse_diff_ranges as parse_diff_ranges
 from ..changes import parse_git_diff_ranges as parse_git_diff_ranges
+from ..changes import parse_svn_diff_ranges as parse_svn_diff_ranges
 from ..incremental import (
     get_changed_files as get_changed_files,
 )
@@ -43,8 +51,17 @@ from ._common import (
     _validate_repo_root,
 )
 
+# -- analysis_tools ---------------------------------------------------------
+from .analysis_tools import (
+    get_bridge_nodes_func,
+    get_hub_nodes_func,
+    get_knowledge_gaps_func,
+    get_suggested_questions_func,
+    get_surprising_connections_func,
+)
+
 # -- build ------------------------------------------------------------------
-from .build import build_or_update_graph
+from .build import build_or_update_graph, run_postprocess
 
 # -- community_tools --------------------------------------------------------
 from .community_tools import (
@@ -52,6 +69,9 @@ from .community_tools import (
     get_community_func,
     list_communities_func,
 )
+
+# -- context ----------------------------------------------------------------
+from .context import get_minimal_context
 
 # -- docs -------------------------------------------------------------------
 from .docs import embed_graph, generate_wiki_func, get_docs_section, get_wiki_page_func
@@ -66,6 +86,7 @@ from .query import (
     list_graph_stats,
     query_graph,
     semantic_search_nodes,
+    traverse_graph_func,
 )
 
 # -- refactor_tools ---------------------------------------------------------
@@ -88,6 +109,9 @@ __all__ = [
     "_validate_repo_root",
     # build
     "build_or_update_graph",
+    "run_postprocess",
+    # context
+    "get_minimal_context",
     # community_tools
     "get_architecture_overview_func",
     "get_community_func",
@@ -106,6 +130,7 @@ __all__ = [
     "list_graph_stats",
     "query_graph",
     "semantic_search_nodes",
+    "traverse_graph_func",
     # refactor_tools
     "apply_refactor_func",
     "refactor_func",
@@ -116,8 +141,16 @@ __all__ = [
     "detect_changes_func",
     "get_affected_flows_func",
     "get_review_context",
+    # analysis_tools
+    "get_bridge_nodes_func",
+    "get_hub_nodes_func",
+    "get_knowledge_gaps_func",
+    "get_suggested_questions_func",
+    "get_surprising_connections_func",
     # re-exported for backward compat (used in test patches)
     "get_changed_files",
     "get_staged_and_unstaged",
     "parse_git_diff_ranges",
+    "parse_svn_diff_ranges",
+    "parse_diff_ranges",
 ]

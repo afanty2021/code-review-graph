@@ -3,6 +3,9 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
+import code_review_graph.tools.docs as docs_module
 from code_review_graph.graph import GraphStore, _sanitize_name, node_to_dict
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.tools import (
@@ -11,8 +14,12 @@ from code_review_graph.tools import (
     get_community_func,
     get_docs_section,
     get_flow,
+    get_impact_radius,
+    get_review_context,
     list_communities_func,
     list_flows,
+    query_graph,
+    _validate_repo_root,
 )
 
 
@@ -149,8 +156,232 @@ class TestTools:
         assert edges[0].source_qualified == "/repo/main.py::process"
 
 
+class TestQueryGraphCallTargetFallbacks:
+    """Regression tests for mixed qualified and bare CALLS targets."""
+
+    def setup_method(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.root = Path(self.tmp_dir).resolve()
+        (self.root / ".git").mkdir()
+        (self.root / ".code-review-graph").mkdir()
+
+        self.target_file = str(self.root / "target.m")
+        self.cross_file = str(self.root / "cross.m")
+        self.dispatch_file = str(self.root / "dispatch.m")
+        self.db_path = str(self.root / ".code-review-graph" / "graph.db")
+        self._seed_data()
+
+    def teardown_method(self):
+        import shutil
+
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _seed_data(self):
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Function", name="target_func", file_path=self.target_file,
+                line_start=10, line_end=12, language="objc",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="same_file_caller", file_path=self.target_file,
+                line_start=20, line_end=24, language="objc",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="cross_file_caller", file_path=self.cross_file,
+                line_start=5, line_end=9, language="objc",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{self.target_file}::same_file_caller",
+                target=f"{self.target_file}::target_func",
+                file_path=self.target_file,
+                line=22,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{self.cross_file}::cross_file_caller",
+                target="target_func",
+                file_path=self.cross_file,
+                line=7,
+            ))
+
+            store.upsert_node(NodeInfo(
+                kind="Function", name="dispatcher", file_path=self.dispatch_file,
+                line_start=1, line_end=8, language="objc",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="resolved_helper", file_path=self.dispatch_file,
+                line_start=12, line_end=14, language="objc",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{self.dispatch_file}::dispatcher",
+                target=f"{self.dispatch_file}::resolved_helper",
+                file_path=self.dispatch_file,
+                line=3,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{self.dispatch_file}::dispatcher",
+                target="external_helper",
+                file_path=self.dispatch_file,
+                line=4,
+            ))
+            store.commit()
+
+    def test_callers_of_includes_qualified_and_bare_target_callers(self):
+        result = query_graph(
+            pattern="callers_of",
+            target=f"{self.target_file}::target_func",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        names = {r["name"] for r in result["results"]}
+        assert names == {"same_file_caller", "cross_file_caller"}
+        assert len(result["results"]) == 2
+
+        edge_targets = {e["target"] for e in result["edges"]}
+        assert edge_targets == {f"{self.target_file}::target_func", "target_func"}
+
+    def test_callees_of_includes_resolved_and_bare_target_callees(self):
+        result = query_graph(
+            pattern="callees_of",
+            target=f"{self.dispatch_file}::dispatcher",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        names = {r["name"] for r in result["results"]}
+        assert names == {"resolved_helper", "external_helper"}
+
+        edge_targets = {e["target"] for e in result["edges"]}
+        assert edge_targets == {
+            f"{self.dispatch_file}::resolved_helper",
+            "external_helper",
+        }
+
+
+def _seed_repo_relative_graph(root: Path) -> None:
+    """Seed graph data with cwd-relative paths, as eval repos currently do."""
+    graph_dir = root / ".code-review-graph"
+    graph_dir.mkdir()
+    store = GraphStore(graph_dir / "graph.db")
+    stored_path = "fixtures/sample_repo/src/app.py"
+    try:
+        store.upsert_node(NodeInfo(
+            kind="File",
+            name=stored_path,
+            file_path=stored_path,
+            line_start=1,
+            line_end=6,
+            language="python",
+        ))
+        store.upsert_node(NodeInfo(
+            kind="Function",
+            name="handle",
+            file_path=stored_path,
+            line_start=1,
+            line_end=3,
+            language="python",
+        ))
+        store.commit()
+    finally:
+        store.close()
+
+
+class TestGraphPathResolution:
+    def test_get_review_context_resolves_repo_relative_changed_file(self, tmp_path):
+        repo = tmp_path / "fixtures" / "sample_repo"
+        repo.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "app.py").write_text(
+            "def handle():\n    return 'ok'\n" + ("# padding\n" * 500),
+            encoding="utf-8",
+        )
+        _seed_repo_relative_graph(repo)
+
+        result = get_review_context(
+            changed_files=["src/app.py"],
+            repo_root=str(repo),
+            include_source=False,
+        )
+
+        changed = result["context"]["graph"]["changed_nodes"]
+        assert any(n["name"] == "handle" for n in changed)
+        assert result["context_savings"]["estimated"] is True
+        assert set(result["context_savings"]) == {
+            "estimated",
+            "saved_tokens",
+            "saved_percent",
+        }
+
+    def test_get_impact_radius_resolves_repo_relative_changed_file(self, tmp_path):
+        repo = tmp_path / "fixtures" / "sample_repo"
+        repo.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "app.py").write_text(
+            "def handle():\n    return 'ok'\n",
+            encoding="utf-8",
+        )
+        _seed_repo_relative_graph(repo)
+
+        result = get_impact_radius(
+            changed_files=["src/app.py"],
+            repo_root=str(repo),
+        )
+
+        assert any(n["name"] == "handle" for n in result["changed_nodes"])
+
+    def test_file_summary_resolves_repo_relative_target(self, tmp_path):
+        repo = tmp_path / "fixtures" / "sample_repo"
+        repo.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "app.py").write_text(
+            "def handle():\n    return 'ok'\n",
+            encoding="utf-8",
+        )
+        _seed_repo_relative_graph(repo)
+
+        result = query_graph(
+            pattern="file_summary",
+            target="src/app.py",
+            repo_root=str(repo),
+        )
+
+        assert any(n["name"] == "handle" for n in result["results"])
+
+
+class TestRepoRootValidation:
+    def test_validate_repo_root_accepts_svn_working_copy(self, tmp_path):
+        (tmp_path / ".svn").mkdir()
+
+        assert _validate_repo_root(tmp_path) == tmp_path.resolve()
+
+    def test_validate_repo_root_error_mentions_svn_marker(self, tmp_path):
+        with pytest.raises(ValueError, match=r"\.git, \.svn, or \.code-review-graph"):
+            _validate_repo_root(tmp_path)
+
+
 class TestGetDocsSection:
     """Tests for the get_docs_section tool."""
+
+    def test_explicit_repo_root_uses_that_docs_file(self, tmp_path):
+        (tmp_path / ".code-review-graph").mkdir()
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "LLM-OPTIMIZED-REFERENCE.md").write_text(
+            '<section name="usage">hello</section>\n',
+            encoding="utf-8",
+        )
+
+        result = get_docs_section("usage", repo_root=str(tmp_path))
+
+        assert result["status"] == "ok"
+        assert result["content"] == "hello"
 
     def test_section_not_found(self):
         result = get_docs_section("nonexistent-section")
@@ -172,6 +403,37 @@ class TestGetDocsSection:
         assert result["status"] in ("ok", "not_found")
         if result["status"] == "ok":
             assert len(result["content"]) > 0
+
+    def test_source_tree_docs_lookup_from_outside_repo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("CRG_REPO_ROOT", raising=False)
+
+        result = get_docs_section(section_name="usage")
+
+        assert result["status"] == "ok"
+        assert len(result["content"]) > 0
+
+    def test_packaged_docs_lookup_from_outside_repo(self, tmp_path, monkeypatch):
+        package_dir = tmp_path / "site-packages" / "code_review_graph"
+        tools_dir = package_dir / "tools"
+        docs_dir = package_dir / "docs"
+        tools_dir.mkdir(parents=True)
+        docs_dir.mkdir()
+        (docs_dir / "LLM-OPTIMIZED-REFERENCE.md").write_text(
+            '<section name="usage">packaged docs</section>\n',
+            encoding="utf-8",
+        )
+        work_dir = tmp_path / "elsewhere"
+        work_dir.mkdir()
+
+        monkeypatch.chdir(work_dir)
+        monkeypatch.delenv("CRG_REPO_ROOT", raising=False)
+        monkeypatch.setattr(docs_module, "__file__", str(tools_dir / "docs.py"))
+
+        result = docs_module.get_docs_section("usage")
+
+        assert result["status"] == "ok"
+        assert result["content"] == "packaged docs"
 
 
 class TestFindLargeFunctions:
@@ -682,7 +944,506 @@ class TestCommunityTools:
         assert "summary" in result
 
     def test_get_architecture_overview_summary_format(self):
-        result = get_architecture_overview_func(repo_root=str(self.root))
+        result = get_architecture_overview_func(
+            repo_root=str(self.root), detail_level="standard"
+        )
         assert "Architecture:" in result["summary"]
         assert "communities" in result["summary"]
         assert "cross-community edges" in result["summary"]
+
+    def test_get_architecture_overview_defaults_to_compact_output(self):
+        result = get_architecture_overview_func(repo_root=str(self.root))
+        assert "community pairs" in result["summary"]
+        for c in result["communities"]:
+            assert "members" not in c
+        assert result["context_savings"]["estimated"] is True
+        assert set(result["context_savings"]) == {
+            "estimated",
+            "saved_tokens",
+            "saved_percent",
+        }
+
+    def test_get_architecture_overview_standard_omits_savings_metadata(self):
+        result = get_architecture_overview_func(
+            repo_root=str(self.root), detail_level="standard"
+        )
+        assert "context_savings" not in result
+
+    def test_get_architecture_overview_minimal_drops_members(self):
+        result = get_architecture_overview_func(
+            repo_root=str(self.root), detail_level="minimal"
+        )
+        assert result["status"] == "ok"
+        for c in result["communities"]:
+            assert "members" not in c
+            assert "name" in c and "size" in c and "cohesion" in c
+
+    def test_get_architecture_overview_minimal_aggregates_edges(self):
+        std = get_architecture_overview_func(
+            repo_root=str(self.root), detail_level="standard"
+        )
+        minimal = get_architecture_overview_func(
+            repo_root=str(self.root), detail_level="minimal"
+        )
+        # Minimal edges are pair-aggregated, so count is <= standard's
+        # per-edge count.
+        assert len(minimal["cross_community_edges"]) <= len(
+            std["cross_community_edges"]
+        )
+        for pair in minimal["cross_community_edges"]:
+            assert "source_community" in pair
+            assert "target_community" in pair
+            assert "edge_count" in pair
+            assert pair["edge_count"] >= 1
+            assert isinstance(pair["top_kinds"], list)
+
+    def test_get_architecture_overview_minimal_summary_label(self):
+        result = get_architecture_overview_func(
+            repo_root=str(self.root), detail_level="minimal"
+        )
+        assert "community pairs" in result["summary"]
+
+
+class TestBuildPostprocess:
+    """Tests for postprocess parameter in build_or_update_graph."""
+
+    def setup_method(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp)
+        (self.root / ".git").mkdir()
+        (self.root / "sample.py").write_text(
+            "def hello():\n    pass\n\nclass Foo:\n    pass\n"
+        )
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_postprocess_none_produces_nodes_no_flows(self):
+        from unittest.mock import patch
+
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["sample.py"],
+        ):
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(self.root),
+                postprocess="none",
+            )
+        assert result["status"] == "ok"
+        assert result["total_nodes"] > 0
+        assert result.get("postprocess_level") == "none"
+        assert "flows_detected" not in result
+        assert "communities_detected" not in result
+        assert "fts_indexed" not in result
+
+    def test_postprocess_minimal_has_fts_no_flows(self):
+        from unittest.mock import patch
+
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["sample.py"],
+        ):
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(self.root),
+                postprocess="minimal",
+            )
+        assert result["status"] == "ok"
+        assert result.get("postprocess_level") == "minimal"
+        assert result.get("signatures_updated") is True
+        assert "flows_detected" not in result
+        assert "communities_detected" not in result
+
+    def test_postprocess_full_matches_default(self):
+        from unittest.mock import patch
+
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["sample.py"],
+        ):
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(self.root),
+                postprocess="full",
+            )
+        assert result["status"] == "ok"
+        assert result.get("postprocess_level") == "full"
+        # Full postprocess should have flows and communities
+        assert "flows_detected" in result
+        assert "communities_detected" in result
+
+
+class TestComputeSummaries:
+    """Tests for _compute_summaries: pins the contents of the three
+    summary tables so that the batch-aggregate refactor can't silently
+    change behavior.
+    """
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.store = GraphStore(self.tmp.name)
+        self._seed_graph()
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _seed_graph(self):
+        """Seed a small graph with two communities, some CALLS/TESTED_BY
+        edges, and a node name that triggers the security keyword check.
+
+        Shape (auth.py community, community_id=1):
+            login  ->  check_token   (CALLS, internal)
+            logout ->  check_token   (CALLS, internal)
+            test_login -> login      (TESTED_BY)
+            test_login -> logout     (TESTED_BY)
+            (login is called from db.py::query to force cross-community
+             edges into caller_counts)
+
+        Shape (db.py community, community_id=2):
+            query   -> connect       (CALLS, internal)
+            close   -> connect       (CALLS, internal)
+            (query also calls login across the community boundary)
+        """
+        # Auth cluster files / nodes
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="auth.py", file_path="auth.py",
+            line_start=1, line_end=100, language="python",
+        ))
+        for fn in ("login", "logout", "check_token"):
+            self.store.upsert_node(NodeInfo(
+                kind="Function", name=fn, file_path="auth.py",
+                line_start=1, line_end=10, language="python",
+            ))
+        self.store.upsert_node(NodeInfo(
+            kind="Test", name="test_login", file_path="tests/test_auth.py",
+            line_start=1, line_end=5, language="python",
+        ))
+
+        # DB cluster files / nodes
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="db.py", file_path="db.py",
+            line_start=1, line_end=100, language="python",
+        ))
+        for fn in ("connect", "query", "close"):
+            self.store.upsert_node(NodeInfo(
+                kind="Function", name=fn, file_path="db.py",
+                line_start=1, line_end=10, language="python",
+            ))
+
+        # Internal edges
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="auth.py::login",
+            target="auth.py::check_token", file_path="auth.py", line=5,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="auth.py::logout",
+            target="auth.py::check_token", file_path="auth.py", line=10,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="db.py::query",
+            target="db.py::connect", file_path="db.py", line=5,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="db.py::close",
+            target="db.py::connect", file_path="db.py", line=10,
+        ))
+
+        # Cross-community CALLS — boosts login's caller_count.
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="db.py::query",
+            target="auth.py::login", file_path="db.py", line=3,
+        ))
+
+        # TESTED_BY edges from the Test node back to auth functions.
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY", source="auth.py::login",
+            target="tests/test_auth.py::test_login",
+            file_path="tests/test_auth.py", line=1,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY", source="auth.py::logout",
+            target="tests/test_auth.py::test_login",
+            file_path="tests/test_auth.py", line=1,
+        ))
+
+        self.store.commit()
+
+        # Create the two communities and stamp community_id on nodes.
+        conn = self.store._conn
+        conn.execute(
+            "INSERT INTO communities (name, level, cohesion, size, "
+            "dominant_language, description) "
+            "VALUES (?, 0, 1.0, 3, 'python', 'auth community')",
+            ("auth-cluster",),
+        )
+        conn.execute(
+            "INSERT INTO communities (name, level, cohesion, size, "
+            "dominant_language, description) "
+            "VALUES (?, 0, 1.0, 3, 'python', 'db community')",
+            ("db-cluster",),
+        )
+        # Assign community_id by looking up the auto-assigned ids.
+        auth_cid = conn.execute(
+            "SELECT id FROM communities WHERE name='auth-cluster'"
+        ).fetchone()[0]
+        db_cid = conn.execute(
+            "SELECT id FROM communities WHERE name='db-cluster'"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE nodes SET community_id = ? WHERE file_path = 'auth.py'",
+            (auth_cid,),
+        )
+        conn.execute(
+            "UPDATE nodes SET community_id = ? WHERE file_path = 'db.py'",
+            (db_cid,),
+        )
+        conn.commit()
+        self._auth_cid = auth_cid
+        self._db_cid = db_cid
+
+    def test_risk_index_populated_with_correct_values(self):
+        """risk_index rows must match per-node caller counts, test
+        coverage, security flag, and risk scores derived from the
+        seeded graph."""
+        from code_review_graph.tools.build import _compute_summaries
+
+        _compute_summaries(self.store)
+
+        rows = self.store._conn.execute(
+            "SELECT qualified_name, caller_count, test_coverage, "
+            "security_relevant, risk_score FROM risk_index"
+        ).fetchall()
+        by_qn = {r[0]: r for r in rows}
+
+        # login: called once (by db.py::query), tested, security-keyword
+        # -> caller_count=1, coverage=tested, sec_relevant=1
+        # risk: caller_count<=3 (0) + tested (0) + sec (0.4) = 0.4
+        login = by_qn["auth.py::login"]
+        assert login[1] == 1  # caller_count
+        assert login[2] == "tested"  # test_coverage
+        assert login[3] == 1  # security_relevant
+        assert login[4] == pytest.approx(0.4)
+
+        # logout: not called by anyone, tested, security-keyword is false
+        #   ("logout" does not match any keyword)
+        # risk: untested(0)/tested(0) + sec(0) = 0 + 0 = 0
+        # Actually: coverage=tested (TESTED_BY edge exists), sec=0, caller=0
+        # risk = 0
+        logout = by_qn["auth.py::logout"]
+        assert logout[1] == 0
+        assert logout[2] == "tested"
+        assert logout[3] == 0
+        assert logout[4] == pytest.approx(0.0)
+
+        # check_token: called twice (login, logout), untested,
+        # "token" matches security keyword
+        # risk: caller<=3(0) + untested(0.3) + sec(0.4) = 0.7
+        ct = by_qn["auth.py::check_token"]
+        assert ct[1] == 2
+        assert ct[2] == "untested"
+        assert ct[3] == 1
+        assert ct[4] == pytest.approx(0.7)
+
+        # connect: called twice, untested, not security
+        # risk: 0 + 0.3 + 0 = 0.3
+        connect = by_qn["db.py::connect"]
+        assert connect[1] == 2
+        assert connect[2] == "untested"
+        assert connect[3] == 0
+        assert connect[4] == pytest.approx(0.3)
+
+        # query: not called, untested, not security
+        # risk: 0 + 0.3 + 0 = 0.3
+        query = by_qn["db.py::query"]
+        assert query[1] == 0
+        assert query[2] == "untested"
+        assert query[3] == 0
+        assert query[4] == pytest.approx(0.3)
+
+        # test_login (kind=Test): not called, untested, not security
+        # Test nodes are included in risk_index via the kind filter.
+        assert "tests/test_auth.py::test_login" in by_qn
+
+    def test_community_summaries_populated_with_correct_values(self):
+        """community_summaries rows must match per-community key
+        symbols, size, and dominant language."""
+        import json as _json
+
+        from code_review_graph.tools.build import _compute_summaries
+
+        _compute_summaries(self.store)
+
+        rows = self.store._conn.execute(
+            "SELECT community_id, name, key_symbols, size, "
+            "dominant_language FROM community_summaries"
+        ).fetchall()
+        assert len(rows) == 2
+        by_name = {r[1]: r for r in rows}
+
+        auth_row = by_name["auth-cluster"]
+        assert auth_row[0] == self._auth_cid
+        assert auth_row[3] == 3  # size
+        assert auth_row[4] == "python"
+
+        # Top symbols in auth cluster by in+out edge count:
+        #   login: 1 out (CALLS check_token) + 1 out (TESTED_BY test_login)
+        #          + 1 in (CALLS from db.query) = 3
+        #   logout: 1 out (CALLS) + 1 out (TESTED_BY) = 2
+        #   check_token: 2 in (CALLS from login, logout) = 2
+        auth_syms = _json.loads(auth_row[2])
+        assert auth_syms[0] == "login"
+        assert set(auth_syms[:3]) == {"login", "logout", "check_token"}
+
+        db_row = by_name["db-cluster"]
+        assert db_row[0] == self._db_cid
+        assert db_row[3] == 3
+        assert db_row[4] == "python"
+
+        # Top symbols in db cluster:
+        #   connect: 2 in (CALLS from query, close) = 2
+        #   query: 2 out (CALLS to connect, login) = 2
+        #   close: 1 out (CALLS to connect) = 1
+        db_syms = _json.loads(db_row[2])
+        assert set(db_syms[:2]) == {"connect", "query"}
+        assert db_syms[-1] == "close" or "close" in db_syms
+
+    def test_compute_summaries_does_not_scale_per_node(self):
+        """Regression guard: SELECT-with-single-row-WHERE-filter queries
+        (the per-row pattern that caused the Godot hang) must stay
+        bounded regardless of how many nodes the fixture has.
+
+        Uses ``sqlite3.Connection.set_trace_callback`` to count DML
+        statements that look like per-row lookups. Note that
+        ``set_trace_callback`` hands back the *expanded* SQL string
+        with parameters substituted as literals, so we match against
+        the expanded form (``= 'foo'`` or ``= 123``) rather than the
+        ``?`` placeholder.
+
+        The batched refactor issues aggregate GROUP BY queries once
+        up front, so this count stays at zero; the pre-refactor code
+        grew linearly with the number of Function/Class/Test nodes
+        and communities.
+        """
+        import re
+
+        from code_review_graph.tools.build import _compute_summaries
+
+        conn = self.store._conn
+        per_row_selects: list[str] = []
+
+        # Match SELECTs whose WHERE filter is a single equality against
+        # a qualified_name literal or an integer id literal — the shape
+        # of all three per-row patterns we refactored away:
+        #   WHERE target_qualified = 'some.qn'   (risk_index caller_count)
+        #   WHERE source_qualified = 'some.qn'   (risk_index test coverage)
+        #   WHERE community_id = 5               (community_summaries)
+        #   FROM nodes WHERE id = 42             (flow_snapshots node name)
+        per_row_re = re.compile(
+            r"\bwhere\s+(?:n\.)?"
+            r"(target_qualified|source_qualified|community_id|id)\s*=\s*"
+            r"(?:'[^']*'|\d+)",
+            re.IGNORECASE,
+        )
+
+        def trace(sql: str) -> None:
+            normalized = sql.strip().lower()
+            if not normalized.startswith("select"):
+                return
+            if per_row_re.search(normalized):
+                per_row_selects.append(sql)
+
+        conn.set_trace_callback(trace)
+        try:
+            _compute_summaries(self.store)
+        finally:
+            conn.set_trace_callback(None)
+
+        # The batched refactor should emit zero per-row lookups.
+        # Pre-refactor, on this 6-Function/1-Test fixture with 2
+        # communities, we would have seen at least
+        # (7 risk nodes × 2 COUNT queries) + (2 comms × 2 setup
+        # queries) ≈ 18. A failure here prints the offending SQL so
+        # the regression is easy to spot.
+        assert not per_row_selects, (
+            f"_compute_summaries issued {len(per_row_selects)} per-row "
+            "SELECTs — the batch-aggregate refactor has regressed:\n"
+            + "\n".join(f"  - {s}" for s in per_row_selects[:5])
+        )
+
+
+class TestGetMinimalContext:
+    """Tests for get_minimal_context tool."""
+
+    def setup_method(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp)
+        (self.root / ".git").mkdir()
+        (self.root / ".code-review-graph").mkdir()
+        # Create a small graph
+        db_path = self.root / ".code-review-graph" / "graph.db"
+        self.store = GraphStore(str(db_path))
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="app.py", file_path=str(self.root / "app.py"),
+            line_start=1, line_end=50, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="main", file_path=str(self.root / "app.py"),
+            line_start=5, line_end=20, language="python",
+        ))
+        self.store.commit()
+        self.store.close()
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_returns_required_keys(self):
+        from code_review_graph.tools.context import get_minimal_context
+
+        result = get_minimal_context(
+            task="explore codebase", repo_root=str(self.root),
+        )
+        assert result["status"] == "ok"
+        assert "summary" in result
+        assert "next_tool_suggestions" in result
+
+    def test_output_is_compact(self):
+        import json
+
+        from code_review_graph.tools.context import get_minimal_context
+
+        result = get_minimal_context(
+            task="review changes", repo_root=str(self.root),
+        )
+        serialized = json.dumps(result, default=str)
+        assert len(serialized) < 800
+
+    def test_task_routing_review(self):
+        from code_review_graph.tools.context import get_minimal_context
+
+        result = get_minimal_context(
+            task="review PR #42", repo_root=str(self.root),
+        )
+        assert "detect_changes" in result["next_tool_suggestions"]
+
+    def test_task_routing_debug(self):
+        from code_review_graph.tools.context import get_minimal_context
+
+        result = get_minimal_context(
+            task="debug login bug", repo_root=str(self.root),
+        )
+        assert "semantic_search_nodes" in result["next_tool_suggestions"]
+
+    def test_task_routing_refactor(self):
+        from code_review_graph.tools.context import get_minimal_context
+
+        result = get_minimal_context(
+            task="refactor auth module", repo_root=str(self.root),
+        )
+        assert "refactor" in result["next_tool_suggestions"]

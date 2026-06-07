@@ -294,6 +294,42 @@ class TestChanges:
         # helper should have flow participation bonus.
         assert helper_score >= isolated_score
 
+    def test_risk_score_weighted_by_flow_criticality(self):
+        """Nodes in high-criticality flows score higher than low-criticality."""
+        # Build two separate flows with different criticality
+        self._add_func("hi_entry", path="hi.py", line_start=1, line_end=5)
+        self._add_func("hi_func", path="hi.py", line_start=10, line_end=20)
+        self._add_call("hi.py::hi_entry", "hi.py::hi_func")
+
+        self._add_func("lo_entry", path="lo.py", line_start=1, line_end=5)
+        self._add_func("lo_func", path="lo.py", line_start=10, line_end=20)
+        self._add_call("lo.py::lo_entry", "lo.py::lo_func")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        # Manually set different criticality values
+        self.store._conn.execute(
+            "UPDATE flows SET criticality = 0.9 "
+            "WHERE name = 'hi_entry'"
+        )
+        self.store._conn.execute(
+            "UPDATE flows SET criticality = 0.1 "
+            "WHERE name = 'lo_entry'"
+        )
+        self.store.commit()
+
+        hi = self.store.get_node("hi.py::hi_func")
+        lo = self.store.get_node("lo.py::lo_func")
+        assert hi and lo
+
+        hi_score = compute_risk_score(self.store, hi)
+        lo_score = compute_risk_score(self.store, lo)
+        assert hi_score > lo_score, (
+            f"High-criticality flow node ({hi_score}) should score "
+            f"higher than low-criticality ({lo_score})"
+        )
+
     # ---------------------------------------------------------------
     # analyze_changes
     # ---------------------------------------------------------------
@@ -437,3 +473,45 @@ class TestChanges:
             assert "risk_score" in result
             assert "test_gaps" in result
             assert "review_priorities" in result
+
+
+class TestAnalyzeChangesFunctionCap:
+    """Regression tests for O(N) slowdown when PR touches many functions."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _add_funcs(self, count: int, path: str = "app.py") -> None:
+        for i in range(count):
+            node = NodeInfo(
+                kind="Function", name=f"func_{i}", file_path=path,
+                line_start=i * 10 + 1, line_end=i * 10 + 9, language="python",
+            )
+            self.store.upsert_node(node, file_hash="abc")
+        self.store.commit()
+
+    def test_changed_funcs_capped(self, monkeypatch):
+        """analyze_changes processes at most CRG_MAX_CHANGED_FUNCS functions."""
+        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "10")
+        self._add_funcs(20)
+
+        result = analyze_changes(self.store, changed_files=["app.py"])
+
+        assert len(result["changed_functions"]) == 10
+        assert result["functions_truncated"] is True
+        assert "CRG_MAX_CHANGED_FUNCS" in result["summary"]
+
+    def test_no_truncation_below_cap(self, monkeypatch):
+        """analyze_changes processes all functions when count is below cap."""
+        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "50")
+        self._add_funcs(5)
+
+        result = analyze_changes(self.store, changed_files=["app.py"])
+
+        assert len(result["changed_functions"]) == 5
+        assert result["functions_truncated"] is False

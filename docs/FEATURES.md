@@ -1,6 +1,31 @@
 # Features
 
-## v2.1.0 (Current)
+## v2.3.5 (Current)
+- **Token Savings panel on every brief CLI call**: `code-review-graph detect-changes --brief` and the new `code-review-graph update --brief` print a boxed `Token Savings` panel — full-context baseline, graph response, saved tokens, percent, and per-category breakdown (Functions / Tests / Risk / Other) that sums exactly to the graph response size.
+- **`--verify` flag**: cross-checks the displayed numbers against OpenAI's `cl100k_base` tokenizer (the GPT-4 family). Adds a second `Verified (tiktoken)` row showing real token counts. Calibration across 222 mixed-language files shows the estimate is within ~1% of real tokens in aggregate.
+- **`update --brief`**: incremental update + the same risk panel in one command. Distinct from `detect-changes --brief` (which is read-only against the existing graph) — use update when the graph might be stale (post-rebase, large change set).
+- **`code-review-graph embed` CLI subcommand**: explicit shell-level access to embedding generation. Previously only reachable via MCP.
+- **Deterministic eval pipeline**: all 6 eval configs pin upstream SHAs, `eval/runner.py` uses full clones with explicit `returncode` checks, and Leiden community detection uses a fixed seed (`CRG_LEIDEN_SEED=42`). Two runs on different machines produce identical numbers.
+- **`multi_hop_retrieval` benchmark**: 11 hand-curated 2-step tool-chain tasks (`hybrid_search` → `query_graph`) across the 6 test repos. Average score 0.909.
+- **Richer semantic search**: `embeddings._node_to_text` now includes the dotted form (`Module.Class.method`), word-split identifiers, and enclosing module directory. Search ranking on natural-language queries improved from 0.545 → 0.909 on the multi-hop benchmark.
+- **Identifier-aware search boost**: `extract_query_identifiers` pulls dotted / snake_case / CamelCase tokens out of NL queries and boosts matching qualified-names ×2.0 in hybrid search.
+- **Path normalization fix**: `eval/runner.py` now resolves repo paths absolutely before storing, so the eval-built graph matches the CLI/MCP-built graph and `update` doesn't create duplicate nodes for the same source location.
+- **Test-gap dedup**: the `Untested:` line in the brief summary dedupes by bare name (defensive guard if duplicate qualified_names slip in).
+- **FTS5 auto-rebuild in eval**: the eval framework now calls `run_post_processing` after `full_build`, so FTS5 is populated automatically instead of leaving the index empty.
+
+## v2.3.4
+- **Estimated context savings**: Review, impact, detect-changes, and compact architecture responses include tiny `context_savings` metadata (`estimated`, `saved_tokens`, `saved_percent`) where a baseline can be estimated.
+- **Compact architecture overview by default**: `get_architecture_overview_tool` defaults to `detail_level="minimal"` to avoid huge member lists and per-edge payloads. Use `detail_level="standard"` for full detail.
+- **Bounded change analysis**: `CRG_MAX_CHANGED_FUNCS`, `CRG_MAX_TRANSITIVE_FRONTIER`, and `CRG_TOOL_TIMEOUT` help keep large MCP review calls responsive.
+- **Windows MCP reliability**: Local embedding models are pre-warmed on Windows before FastMCP starts worker dispatch to avoid semantic-search deadlocks.
+- **Parser correctness**: Rust `#[test]` and common async test attributes now produce `Test` nodes.
+- **Graph lookup correctness**: Review, impact, and file-summary tools resolve user-facing paths to stored graph paths; `callers_of` includes cross-file callers even when same-file callers exist.
+- **Install/runtime reliability**: Generated Codex/Claude hooks drain stdin, bundled docs are available from wheels, missing local embeddings report unavailable status, and `.svn` roots pass validation.
+- **CLI reliability**: `build --skip-postprocess` and `update --skip-flows` honor the requested post-processing level.
+- **Broad parser surface**: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files.
+- **Local-first by design**: SQLite graph storage remains local, with no telemetry and no cloud-default behavior.
+
+## v2.0.0
 - **22 MCP tools** (up from 9): 13 new tools for flows, communities, architecture, refactoring, wiki, multi-repo, and risk-scored change detection.
 - **5 MCP prompts**: `review_changes`, `architecture_map`, `debug_issue`, `onboard_developer`, `pre_merge_check` workflow templates.
 - **18 languages** (up from 15): Added Dart, R, Perl support.
@@ -109,7 +134,8 @@
 - **FastMCP 3.0 compatible** stdio MCP server
 
 ## Privacy & Data
-- All data stays 100% local
+- Core graph data is stored locally
 - Graph stored in `.code-review-graph/graph.db` (SQLite), auto-gitignored
-- No telemetry, no network calls
+- No telemetry; core graph/review workflows do not require network access
+- Optional embedding and wiki features may call configured local or remote services when explicitly enabled
 - Respects `.gitignore` and `.code-review-graphignore`

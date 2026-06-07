@@ -1,6 +1,6 @@
 """Change impact analysis for code review.
 
-Maps git diffs to affected functions, flows, communities, and test coverage
+Maps git/svn diffs to affected functions, flows, communities, and test coverage
 gaps. Produces risk-scored, priority-ordered review guidance.
 """
 
@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
@@ -21,10 +22,11 @@ logger = logging.getLogger(__name__)
 _GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
 
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
+_SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
-# 1. parse_git_diff_ranges
+# 1. parse_git_diff_ranges / parse_svn_diff_ranges
 # ---------------------------------------------------------------------------
 
 
@@ -49,7 +51,10 @@ def parse_git_diff_ranges(
         result = subprocess.run(
             ["git", "diff", "--unified=0", base, "--"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=repo_root,
             timeout=_GIT_TIMEOUT,
         )
@@ -61,6 +66,71 @@ def parse_git_diff_ranges(
         return {}
 
     return _parse_unified_diff(result.stdout)
+
+
+def parse_svn_diff_ranges(
+    repo_root: str,
+    rev_range: str | None = None,
+) -> dict[str, list[tuple[int, int]]]:
+    """Run ``svn diff`` and extract changed line ranges per file.
+
+    Args:
+        repo_root: Absolute path to the SVN working copy root.
+        rev_range: Optional SVN revision range in ``rXXX:HEAD`` format.
+            When *None*, diffs the working copy against BASE (local changes).
+
+    Returns:
+        Mapping of file paths to lists of ``(start_line, end_line)`` tuples.
+        Returns an empty dict on error.
+    """
+    cmd = ["svn", "diff", "--non-interactive"]
+    if rev_range:
+        if not _SAFE_SVN_REV.match(rev_range):
+            logger.warning("Invalid SVN revision range rejected: %s", rev_range)
+            return {}
+        cmd.extend(["-r", rev_range])
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=repo_root,
+            timeout=_GIT_TIMEOUT,
+        )
+        if result.returncode != 0:
+            logger.warning("svn diff failed (rc=%d): %s", result.returncode, result.stderr[:200])
+            return {}
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("svn diff error: %s", exc)
+        return {}
+
+    return _parse_unified_diff(result.stdout)
+
+
+def parse_diff_ranges(
+    repo_root: str,
+    base: str = "HEAD~1",
+) -> dict[str, list[tuple[int, int]]]:
+    """Auto-detect VCS and return changed line ranges per file.
+
+    Dispatches to :func:`parse_git_diff_ranges` for Git repositories and
+    :func:`parse_svn_diff_ranges` for SVN working copies.
+
+    Args:
+        repo_root: Absolute path to the repository/working-copy root.
+        base: For Git: the ref to diff against (default ``HEAD~1``).
+              For SVN: an optional revision range (e.g. ``"r100:HEAD"``);
+              when *base* is not a valid SVN revision, working-copy changes
+              (``svn diff``) are used instead.
+    """
+    root_path = Path(repo_root)
+    if (root_path / ".svn").exists():
+        rev_range = base if _SAFE_SVN_REV.match(base) else None
+        return parse_svn_diff_ranges(repo_root, rev_range)
+    return parse_git_diff_ranges(repo_root, base)
 
 
 def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
@@ -152,15 +222,19 @@ def compute_risk_score(store: GraphStore, node: GraphNode) -> float:
     Scoring factors:
       - Flow participation: 0.05 per flow membership, capped at 0.25
       - Community crossing: 0.05 per caller from a different community, capped at 0.15
-      - Test coverage: 0.30 if no TESTED_BY edges, 0.05 if tested
+      - Test coverage: 0.30 (untested) scaling down to 0.05 (5+ TESTED_BY edges)
       - Security sensitivity: 0.20 if name matches security keywords
       - Caller count: callers / 20, capped at 0.10
     """
     score = 0.0
 
-    # --- Flow participation (cap 0.25) ---
-    flow_count = store.count_flow_memberships(node.id)
-    score += min(flow_count * 0.05, 0.25)
+    # --- Flow participation (cap 0.25), weighted by criticality ---
+    flow_criticalities = store.get_flow_criticalities_for_node(node.id)
+    if flow_criticalities:
+        score += min(sum(flow_criticalities), 0.25)
+    else:
+        flow_count = store.count_flow_memberships(node.id)
+        score += min(flow_count * 0.05, 0.25)
 
     # --- Community crossing (cap 0.15) ---
     callers = store.get_edges_by_target(node.qualified_name)
@@ -177,10 +251,10 @@ def compute_risk_score(store: GraphStore, node: GraphNode) -> float:
                 cross_community += 1
     score += min(cross_community * 0.05, 0.15)
 
-    # --- Test coverage ---
-    tested_edges = store.get_edges_by_target(node.qualified_name)
-    has_test = any(e.kind == "TESTED_BY" for e in tested_edges)
-    score += 0.05 if has_test else 0.30
+    # --- Test coverage (direct + transitive) ---
+    transitive_tests = store.get_transitive_tests(node.qualified_name)
+    test_count = len(transitive_tests)
+    score += 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
 
     # --- Security sensitivity ---
     name_lower = node.name.lower()
@@ -213,9 +287,10 @@ def analyze_changes(
         store: The graph store.
         changed_files: List of changed file paths.
         changed_ranges: Optional pre-parsed diff ranges. If not provided and
-            ``repo_root`` is given, they are computed via git.
-        repo_root: Repository root (for git diff).
-        base: Git ref to diff against.
+            ``repo_root`` is given, they are computed via the detected VCS
+            (Git or SVN).
+        repo_root: Repository root (for git/svn diff).
+        base: Git ref or SVN revision range to diff against.
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
@@ -223,7 +298,7 @@ def analyze_changes(
     """
     # Compute changed ranges if not provided.
     if changed_ranges is None and repo_root is not None:
-        changed_ranges = parse_git_diff_ranges(repo_root, base)
+        changed_ranges = parse_diff_ranges(repo_root, base)
 
     # Map changes to nodes.
     if changed_ranges:
@@ -239,6 +314,12 @@ def analyze_changes(
         n for n in changed_nodes
         if n.kind in ("Function", "Test", "Class")
     ]
+
+    # Cap to prevent O(N*M) query explosion on large PRs.
+    _max_funcs = int(os.environ.get("CRG_MAX_CHANGED_FUNCS", "500"))
+    funcs_truncated = len(changed_funcs) > _max_funcs
+    if funcs_truncated:
+        changed_funcs = changed_funcs[:_max_funcs]
 
     # Compute per-node risk scores.
     node_risks: list[dict[str, Any]] = []
@@ -282,8 +363,29 @@ def analyze_changes(
         f"  - Overall risk score: {overall_risk:.2f}",
     ]
     if test_gaps:
-        gap_names = [g["name"] for g in test_gaps[:5]]
+        # Dedup by bare name in the human summary. The underlying test_gaps
+        # list keeps every entry (a downstream consumer needs precision via
+        # qualified_name), but a graph that ended up with the same function
+        # stored under two qualified_names (e.g. relative + absolute path
+        # variants) would otherwise print "X, X, Y, Y" — surfacing graph
+        # corruption as a UX bug. The root cause is path normalization;
+        # this is the defensive last line.
+        seen_names: set[str] = set()
+        gap_names: list[str] = []
+        for g in test_gaps:
+            n = g["name"]
+            if n in seen_names:
+                continue
+            seen_names.add(n)
+            gap_names.append(n)
+            if len(gap_names) >= 5:
+                break
         summary_parts.append(f"  - Untested: {', '.join(gap_names)}")
+    if funcs_truncated:
+        summary_parts.append(
+            f"  - Warning: analysis capped at {_max_funcs} functions "
+            f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
+        )
 
     return {
         "summary": "\n".join(summary_parts),
@@ -292,4 +394,5 @@ def analyze_changes(
         "affected_flows": affected["affected_flows"],
         "test_gaps": test_gaps,
         "review_priorities": review_priorities,
+        "functions_truncated": funcs_truncated,
     }

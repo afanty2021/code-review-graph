@@ -1,5 +1,7 @@
 """Tests for the graph storage and query engine."""
 
+import logging
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -107,6 +109,51 @@ class TestGraphStore:
         result = self.store.get_nodes_by_file("/test/file.py")
         assert len(result) == 2
 
+    def test_store_after_remove_no_transaction_error(self):
+        """Regression test for #135: store_file_nodes_edges after
+        remove_file_data must not raise 'cannot start a transaction
+        within a transaction'.
+        """
+        # Seed initial data for two files
+        nodes_a = [self._make_file_node("/test/a.py")]
+        nodes_b = [self._make_file_node("/test/b.py")]
+        self.store.store_file_nodes_edges("/test/a.py", nodes_a, [])
+        self.store.store_file_nodes_edges("/test/b.py", nodes_b, [])
+
+        # Without the isolation_level=None fix, this would leave an
+        # implicit transaction open and the next call would crash.
+        self.store.remove_file_data("/test/a.py")
+        # Must not raise sqlite3.OperationalError
+        nodes_c = [self._make_file_node("/test/c.py")]
+        self.store.store_file_nodes_edges("/test/c.py", nodes_c, [])
+
+        assert self.store.get_node("/test/a.py") is None
+        assert self.store.get_node("/test/c.py") is not None
+
+    def test_store_after_multiple_removes_no_transaction_error(self):
+        """Regression test for #181: full_build stale-file purge leaves
+        implicit transaction open after multiple remove_file_data calls.
+        """
+        # Seed data for several files
+        for i in range(5):
+            path = f"/test/file_{i}.py"
+            self.store.store_file_nodes_edges(
+                path, [self._make_file_node(path)], [],
+            )
+
+        # Simulates full_build's stale-file purge: multiple deletes in a
+        # row without explicit commit between them.
+        for i in range(3):
+            self.store.remove_file_data(f"/test/file_{i}.py")
+
+        # Next store call must succeed regardless of prior connection state.
+        new_path = "/test/new_file.py"
+        nodes = [self._make_file_node(new_path)]
+        self.store.store_file_nodes_edges(new_path, nodes, [])
+
+        assert self.store.get_node(new_path) is not None
+        assert self.store.get_node("/test/file_0.py") is None
+
     def test_search_nodes(self):
         self.store.upsert_node(self._make_func_node("authenticate"))
         self.store.upsert_node(self._make_func_node("authorize"))
@@ -178,3 +225,170 @@ class TestGraphStore:
         self.store.set_metadata("test_key", "test_value")
         assert self.store.get_metadata("test_key") == "test_value"
         assert self.store.get_metadata("nonexistent") is None
+
+    def test_get_all_community_ids_logs_when_column_missing(self, caplog):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE nodes (qualified_name TEXT PRIMARY KEY)"
+        )
+        store = GraphStore.__new__(GraphStore)
+        store._conn = conn
+
+        with caplog.at_level(logging.DEBUG, logger="code_review_graph.graph"):
+            result = store.get_all_community_ids()
+
+        assert result == {}
+        assert "Community IDs unavailable" in caplog.text
+        conn.close()
+
+    def test_get_communities_list_logs_when_table_missing(self, caplog):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        store = GraphStore.__new__(GraphStore)
+        store._conn = conn
+
+        with caplog.at_level(logging.DEBUG, logger="code_review_graph.graph"):
+            result = store.get_communities_list()
+
+        assert result == []
+        assert "Communities list unavailable" in caplog.text
+        conn.close()
+
+
+class TestImpactRadiusSql:
+    """Tests for get_impact_radius_sql vs NetworkX BFS."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.store = GraphStore(self.tmp.name)
+        self._build_chain()
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _build_chain(self):
+        """Build A -> B -> C -> D chain for testing."""
+        for name, path in [
+            ("func_a", "/a.py"), ("func_b", "/b.py"),
+            ("func_c", "/c.py"), ("func_d", "/d.py"),
+        ]:
+            self.store.upsert_node(NodeInfo(
+                kind="File", name=path, file_path=path,
+                line_start=1, line_end=50, language="python",
+            ))
+            self.store.upsert_node(NodeInfo(
+                kind="Function", name=name, file_path=path,
+                line_start=5, line_end=20, language="python",
+            ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="/a.py::func_a",
+            target="/b.py::func_b", file_path="/a.py", line=10,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="/b.py::func_b",
+            target="/c.py::func_c", file_path="/b.py", line=10,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="/c.py::func_c",
+            target="/d.py::func_d", file_path="/c.py", line=10,
+        ))
+        self.store.commit()
+
+    def test_sql_matches_networkx(self):
+        """SQL and NetworkX BFS produce identical impacted node sets."""
+        sql_result = self.store.get_impact_radius_sql(["/a.py"], max_depth=2)
+        nx_result = self.store._get_impact_radius_networkx(["/a.py"], max_depth=2)
+
+        sql_qns = {n.qualified_name for n in sql_result["impacted_nodes"]}
+        nx_qns = {n.qualified_name for n in nx_result["impacted_nodes"]}
+        assert sql_qns == nx_qns
+
+    def test_max_nodes_truncation(self):
+        """Setting max_nodes=2 should truncate results."""
+        result = self.store.get_impact_radius_sql(
+            ["/a.py"], max_depth=3, max_nodes=2,
+        )
+        # With 4 files in chain + file nodes, max_nodes=2 should limit
+        assert result["total_impacted"] <= 2 or result["truncated"]
+
+    def test_empty_changed_files(self):
+        result = self.store.get_impact_radius_sql([], max_depth=2)
+        assert result["changed_nodes"] == []
+        assert result["impacted_nodes"] == []
+        assert result["total_impacted"] == 0
+
+
+class TestGetTransitiveTestsFrontierCap:
+    """Regression tests for O(N*M) query explosion in get_transitive_tests."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _add_func(self, name: str, path: str) -> str:
+        node = NodeInfo(
+            kind="Function", name=name, file_path=path,
+            line_start=1, line_end=5, language="python",
+        )
+        self.store.upsert_node(node)
+        return f"{path}::{name}"
+
+    def _add_calls_edge(self, source_qn: str, target_qn: str) -> None:
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=source_qn, target=target_qn,
+            file_path=source_qn.split("::")[0], line=1,
+        ))
+
+    def test_frontier_capped_limits_sql_queries(self):
+        """Hub function with 200 callees must not issue 200 TESTED_BY queries."""
+        hub_qn = self._add_func("hub", "/t/hub.py")
+        for i in range(200):
+            callee_qn = self._add_func(f"callee_{i}", "/t/callee.py")
+            self._add_calls_edge(hub_qn, callee_qn)
+        self.store.commit()
+
+        query_count = 0
+
+        def _trace(stmt: str) -> None:
+            nonlocal query_count
+            query_count += 1
+
+        self.store._conn.set_trace_callback(_trace)
+        self.store.get_transitive_tests(hub_qn, max_frontier=50)
+        self.store._conn.set_trace_callback(None)
+
+        # Without cap: 200 callee TESTED_BY queries + overhead = ~204
+        # With cap of 50: ~54 queries max
+        assert query_count <= 60, (
+            f"Expected <=60 queries with frontier cap, got {query_count}"
+        )
+
+    def test_uncapped_small_frontier_unchanged(self):
+        """Small fan-out (< cap) returns same results regardless of cap."""
+        hub_qn = self._add_func("hub", "/t/hub.py")
+        test_qn = self._add_func("test_hub", "/t/test_hub.py")
+        for i in range(5):
+            callee_qn = self._add_func(f"callee_{i}", "/t/callee.py")
+            self._add_calls_edge(hub_qn, callee_qn)
+            # Only callee_2 has a test
+            if i == 2:
+                self.store.upsert_edge(EdgeInfo(
+                    kind="TESTED_BY", source=test_qn, target=callee_qn,
+                    file_path="/t/test_hub.py", line=1,
+                ))
+        self.store.commit()
+
+        results_default = self.store.get_transitive_tests(hub_qn)
+        results_capped = self.store.get_transitive_tests(hub_qn, max_frontier=50)
+
+        indirect_default = [r for r in results_default if r["indirect"]]
+        indirect_capped = [r for r in results_capped if r["indirect"]]
+        assert len(indirect_default) == 1
+        assert len(indirect_capped) == 1
+        assert indirect_default[0]["name"] == indirect_capped[0]["name"]
